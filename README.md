@@ -21,7 +21,6 @@ As far as I tested it's working fine and keeps the connection alive which isn't 
 
 <p align="center">
   <a href="https://github.com/Team-Resurgent/Talon/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
-  <a href="https://github.com/Team-Resurgent/Talon/actions/workflows/release.yml"><img src="https://github.com/Team-Resurgent/Talon/actions/workflows/release.yml/badge.svg" alt="Release"></a>
   <a href="https://discord.gg/VcdSfajQGK"><img src="https://img.shields.io/badge/chat-on%20discord-7289da.svg?logo=discord" alt="Discord"></a>
 </p>
 
