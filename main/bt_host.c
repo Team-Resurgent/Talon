@@ -8,12 +8,14 @@
 #include "bt_host.h"
 #include "bt_hidmap.h"
 #include "talon.h"
+#include "usb_owner.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_hidh.h"
+#include "esp_hid_common.h"
 #include "esp_hid_gap.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -32,6 +34,107 @@ static bool     s_layout_ok;
 static volatile uint32_t s_reports;
 static uint8_t  s_last_raw[32];
 static uint8_t  s_last_len, s_last_id;
+
+// Xbox Series BLE rumble is HID Output Report ID 3. The report has an
+// actuator-enable nibble followed by four 0..100 magnitude bytes, then
+// duration, pause and loop count. We use the first two motors for the
+// Xbox XID left/right rumble channels and leave trigger motors off.
+static TaskHandle_t s_rumble_task;
+
+static uint8_t rumble_percent(uint16_t v) {
+    return (uint8_t)(((uint32_t)v * 100u + 32767u) / 65535u);
+}
+
+static void send_rumble(uint16_t left, uint16_t right) {
+    if (!s_dev || !s_connected || !esp_hidh_dev_exists(s_dev)) return;
+
+    uint8_t l = rumble_percent(left);
+    uint8_t r = rumble_percent(right);
+
+    /*
+     * Xbox Series X/S BLE rumble Report ID 3:
+     *
+     * byte 0: motor enable bits
+     *   bit 0 = center
+     *   bit 1 = shake
+     *   bit 2 = right/main
+     *   bit 3 = left/main
+     *
+     * bytes 1-4: motor magnitudes
+     *   0 = center
+     *   1 = shake
+     *   2 = right/main
+     *   3 = left/main
+     *
+     * byte 5 = duration
+     * byte 6 = pause
+     * byte 7 = loop count
+     */
+
+    uint8_t report[8] = {
+        (uint8_t)((l || r) ? 0x03 : 0x00),  // right + left motors
+        0x00,                                // center
+        0x00,                                // shake
+        r,                                   // right/main
+        l,                                   // left/main
+        (uint8_t)((l || r) ? 10 : 0),      // duration
+        0x00,                                // pause
+        0x00                                 // loop
+    };
+
+    esp_err_t err = esp_hidh_dev_output_set(
+        s_dev,
+        0,
+        3,
+        report,
+        sizeof(report)
+    );
+
+    ESP_LOGI(TAG,
+             "BLE RUMBLE: L=%u R=%u report=%02X %02X %02X %02X %02X %02X %02X %02X err=%s",
+             l, r,
+             report[0], report[1], report[2], report[3],
+             report[4], report[5], report[6], report[7],
+             esp_err_to_name(err));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BLE rumble output failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void rumble_task(void *arg) {
+    uint16_t last_left = 0;
+    uint16_t last_right = 0;
+    TickType_t last_send = 0;
+
+    for (;;) {
+        uint16_t left = 0;
+        uint16_t right = 0;
+
+        talon_get_rumble(&left, &right);
+
+        TickType_t now = xTaskGetTickCount();
+
+        /*
+         * Send immediately when the rumble value changes.
+         * Also refresh an active rumble every 50 ms so a short
+         * duration does not allow the controller to stop vibrating
+         * while the Xbox continues requesting the same value.
+         */
+        bool changed = (left != last_left || right != last_right);
+        bool refresh = ((left || right) &&
+                        ((now - last_send) >= pdMS_TO_TICKS(50)));
+
+        if (changed || refresh) {
+            send_rumble(left, right);
+
+            last_left = left;
+            last_right = right;
+            last_send = now;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
 
 // ---- bond persistence ------------------------------------------------------
 
@@ -130,6 +233,7 @@ static void hidh_cb(void *arg, esp_event_base_t base, int32_t id, void *data) {
         if (bda) bond_store(bda, s_bond_atype);
         build_layout(s_dev);
         s_connected = true;
+        usb_owner_set_ble(true);
         ESP_LOGI(TAG, "controller open: %s", s_dev_name);
         break;
     }
@@ -152,6 +256,7 @@ static void hidh_cb(void *arg, esp_event_base_t base, int32_t id, void *data) {
     case ESP_HIDH_CLOSE_EVENT:
         ESP_LOGW(TAG, "controller closed");
         s_connected = false;
+        usb_owner_set_ble(false);
         s_layout_ok = false;
         if (p->close.dev) esp_hidh_dev_free(p->close.dev);
         s_dev = NULL;
@@ -184,16 +289,25 @@ void bt_host_start(void) {
     ESP_LOGI(TAG, "BLE HID host ready");
     bond_load();
     start_reconnect();
+    if (!s_rumble_task) {
+        xTaskCreate(rumble_task, "bt_rumble", 3072, NULL,
+                    tskIDLE_PRIORITY + 1, &s_rumble_task);
+    }
 }
 
 static void addr_to_str(const uint8_t a[6], char out[18]) {
     snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x", a[0], a[1], a[2], a[3], a[4], a[5]);
 }
 static bool str_to_addr(const char *s, uint8_t out[6]) {
-    int v[6];
-    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+    unsigned int v[6];
+    char tail = 0;
+    if (!s || sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x%c",
+                     &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &tail) != 6)
         return false;
-    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+    for (int i = 0; i < 6; i++) {
+        if (v[i] > 0xff) return false;
+        out[i] = (uint8_t)v[i];
+    }
     return true;
 }
 
@@ -233,7 +347,11 @@ int bt_host_scan_json(char *out, size_t cap) {
 
 bool bt_host_connect(const char *addr_str) {
     uint8_t addr[6];
-    if (!str_to_addr(addr_str, addr)) return false;
+    ESP_LOGI(TAG, "bt_host_connect('%s')", addr_str ? addr_str : "(null)");
+    if (!str_to_addr(addr_str, addr)) {
+        ESP_LOGE(TAG, "invalid Bluetooth address: '%s'", addr_str ? addr_str : "(null)");
+        return false;
+    }
     // Find the address type from the last scan (default public if unseen).
     uint8_t atype = 0;
     for (int i = 0; i < s_scan_n; i++)
@@ -249,6 +367,7 @@ void bt_host_forget(void) {
     bond_erase();
     if (s_dev && esp_hidh_dev_exists(s_dev)) esp_hidh_dev_close(s_dev);
     s_connected = false;
+    usb_owner_set_ble(false);
     if (was) talon_reset_controls();
     ESP_LOGI(TAG, "controller forgotten");
 }
@@ -257,6 +376,7 @@ void bt_host_stop(void) {
     s_have_bond = false;                 // stop the reconnect task's retry loop
     if (s_dev && esp_hidh_dev_exists(s_dev)) esp_hidh_dev_close(s_dev);
     s_connected = false;
+    usb_owner_set_ble(false);
     esp_hidh_deinit();
     // Fully tear BT down (not just disable) so the WiFi/BT software-coexistence
     // layer is removed — with coex still registered, the first OTA flash write
@@ -270,17 +390,91 @@ void bt_host_stop(void) {
     ESP_LOGI(TAG, "BT torn down for OTA");
 }
 
-void bt_host_status_json(char *out, size_t cap) {
+void bt_host_status_json(char *out, size_t cap)
+{
     char addr[18] = "";
-    if (s_have_bond) addr_to_str(s_bond_addr, addr);
+    if (s_have_bond)
+        addr_to_str(s_bond_addr, addr);
+
     // Last raw report as hex, for empirical mapping.
-    char hex[70]; size_t ho = 0;
+    char hex[70];
+    size_t ho = 0;
+
     for (int i = 0; i < s_last_len && ho + 3 < sizeof(hex); i++)
-        ho += snprintf(hex + ho, sizeof(hex) - ho, "%02x", s_last_raw[i]);
+        ho += snprintf(hex + ho, sizeof(hex) - ho, "%02x",
+                       s_last_raw[i]);
+
     hex[ho] = '\0';
+
+    // Current decoded controller state.
+    int state[13] = {0};
+    hid_get_state(state);
+
+    int digital = state[S_DIGITAL];
+
     snprintf(out, cap,
-        "\"bt_connected\":%d,\"bt_bonded\":%d,\"bt_addr\":\"%s\",\"bt_name\":\"%s\","
-        "\"bt_reports\":%lu,\"bt_last_id\":%u,\"bt_last\":\"%s\",\"bt_mapped\":%d",
-        s_connected ? 1 : 0, s_have_bond ? 1 : 0, addr, s_dev_name,
-        (unsigned long)s_reports, s_last_id, hex, s_layout_ok ? 1 : 0);
+        "\"bt_connected\":%d,"
+        "\"bt_bonded\":%d,"
+        "\"bt_addr\":\"%s\","
+        "\"bt_name\":\"%s\","
+        "\"bt_reports\":%lu,"
+        "\"bt_last_id\":%u,"
+        "\"bt_last\":\"%s\","
+        "\"bt_mapped\":%d,"
+
+        "\"a\":%d,"
+        "\"b\":%d,"
+        "\"x\":%d,"
+        "\"y\":%d,"
+        "\"lb\":%d,"
+        "\"rb\":%d,"
+        "\"back\":%d,"
+        "\"start\":%d,"
+        "\"ls\":%d,"
+        "\"rs\":%d,"
+        "\"up\":%d,"
+        "\"down\":%d,"
+        "\"left\":%d,"
+        "\"right\":%d,"
+
+        "\"lt\":%d,"
+        "\"rt\":%d,"
+        "\"lx\":%d,"
+        "\"ly\":%d,"
+        "\"rx\":%d,"
+        "\"ry\":%d",
+
+        s_connected ? 1 : 0,
+        s_have_bond ? 1 : 0,
+        addr,
+        s_dev_name,
+        (unsigned long)s_reports,
+        s_last_id,
+        hex,
+        s_layout_ok ? 1 : 0,
+
+        state[S_A] > 0 ? 1 : 0,
+        state[S_B] > 0 ? 1 : 0,
+        state[S_X] > 0 ? 1 : 0,
+        state[S_Y] > 0 ? 1 : 0,
+
+        state[S_WHITE] > 0 ? 1 : 0,  // LB
+        state[S_BLACK] > 0 ? 1 : 0,  // RB
+
+        (digital & D_BACK)  ? 1 : 0,
+        (digital & D_START) ? 1 : 0,
+        (digital & D_LS)    ? 1 : 0,
+        (digital & D_RS)    ? 1 : 0,
+
+        (digital & D_UP)    ? 1 : 0,
+        (digital & D_DOWN)  ? 1 : 0,
+        (digital & D_LEFT)  ? 1 : 0,
+        (digital & D_RIGHT) ? 1 : 0,
+
+        state[S_LT],
+        state[S_RT],
+        state[S_LX],
+        state[S_LY],
+        state[S_RX],
+        state[S_RY]);
 }

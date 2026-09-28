@@ -26,6 +26,9 @@ void talon_set_state_all(const int vals[13]);
 // Last rumble values received from the Xbox (left/right actuator, 0..65535).
 void talon_get_rumble(uint16_t *left, uint16_t *right);
 
+// USB ownership arbitration (native USB D-/D+ are physically shared with the Xbox).
+void xid_usb_set_enabled(bool enabled);
+
 // Diagnostics for the heartbeat / status endpoint.
 extern volatile uint32_t g_xid_in_ok;      // input reports delivered
 extern volatile uint32_t g_xid_in_err;     // interrupt IN completions with error

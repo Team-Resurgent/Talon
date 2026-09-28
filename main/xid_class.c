@@ -27,6 +27,7 @@ static const char *TAG = "talon.xid";
 static uint8_t s_rhport;
 static uint8_t s_ep_in, s_ep_out;
 static bool    s_configured;
+static volatile bool s_usb_enabled = true;
 static volatile bool s_ota_quiesce;   // set during OTA: stop all USB endpoint arming
 
 volatile uint32_t g_xid_in_ok, g_xid_in_err, g_xid_out_pkts,
@@ -60,13 +61,20 @@ static void parse_rumble(const uint8_t *buf, uint32_t len) {
 // asserts (xQueueSemaphoreTake with scheduler suspended). Quiescing here makes
 // every arm path early-return, so no mutex is taken from the ISR. The device
 // reboots after OTA, so the Xbox link going idle is fine.
+void xid_usb_set_enabled(bool enabled)
+{
+    s_usb_enabled = enabled;
+    if (!enabled && s_configured)
+        usbd_sof_enable(s_rhport, SOF_CONSUMER_USER, false);
+}
+
 void xid_ota_quiesce(void) {
     s_ota_quiesce = true;
     if (s_configured) usbd_sof_enable(s_rhport, SOF_CONSUMER_USER, false);
 }
 
 static void arm_in(uint8_t rhport) {
-    if (!s_configured || s_ota_quiesce) return;
+    if (!s_configured || !s_usb_enabled || s_ota_quiesce) return;
     if (!usbd_edpt_claim(rhport, s_ep_in)) return;
     talon_report_build(s_in_buf);
     if (!usbd_edpt_xfer(rhport, s_ep_in, s_in_buf, XID_REPORT_LEN, false)) {
@@ -75,7 +83,7 @@ static void arm_in(uint8_t rhport) {
 }
 
 static void arm_out(uint8_t rhport) {
-    if (!s_configured || s_ota_quiesce) return;
+    if (!s_configured || !s_usb_enabled || s_ota_quiesce) return;
     if (!usbd_edpt_claim(rhport, s_ep_out)) return;
     if (!usbd_edpt_xfer(rhport, s_ep_out, s_out_buf, sizeof(s_out_buf), false)) {
         usbd_edpt_release(rhport, s_ep_out);
@@ -216,7 +224,7 @@ static bool xid_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
 // went idle because a submit failed.
 static void xid_sof(uint8_t rhport, uint32_t frame_count) {
     (void)frame_count;
-    if (!s_configured || s_ota_quiesce) return;
+    if (!s_configured || !s_usb_enabled || s_ota_quiesce) return;
     arm_in(rhport);
     arm_out(rhport);
 }

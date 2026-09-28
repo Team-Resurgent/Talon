@@ -13,6 +13,7 @@ idf_component_register(
          "esp_hid_gap.c"
          "led_status.c"
          "ota.c"
+         "usb_owner.c"
     INCLUDE_DIRS "."
     EMBED_TXTFILES "index.html" "setup.html" "ota.html"
     PRIV_REQUIRES esp_wifi nvs_flash esp_netif esp_event esp_http_server

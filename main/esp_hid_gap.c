@@ -31,6 +31,28 @@
 #endif
 
 static const char *TAG = "ESP_HID_GAP";
+#if CONFIG_BT_BLE_ENABLED && !CONFIG_BT_NIMBLE_ENABLED
+static void talon_gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
+                                 esp_ble_gattc_cb_param_t *param)
+{
+    if (event == ESP_GATTC_REG_EVT) {
+        ESP_LOGI(TAG, "GATTC REG: if=%u status=0x%x app_id=%u",
+                 gattc_if, param ? param->reg.status : 0xff,
+                 param ? param->reg.app_id : 0);
+    } else if (event == ESP_GATTC_OPEN_EVT && param) {
+        ESP_LOGI(TAG, "GATTC OPEN: if=%u conn_id=%u status=0x%x",
+                 gattc_if, param->open.conn_id, param->open.status);
+    } else if (event == ESP_GATTC_CLOSE_EVT && param) {
+        ESP_LOGW(TAG, "GATTC CLOSE: if=%u conn_id=%u status=0x%x reason=0x%x",
+                 gattc_if, param->close.conn_id, param->close.status, param->close.reason);
+    } else if (event == ESP_GATTC_DISCONNECT_EVT && param) {
+        ESP_LOGW(TAG, "GATTC DISCONNECT: if=%u conn_id=%u reason=0x%x",
+                 gattc_if, param->disconnect.conn_id, param->disconnect.reason);
+    }
+    // The HID component owns the actual GATT state machine.
+    esp_hidh_gattc_event_handler(event, gattc_if, param);
+}
+#endif
 
 // uncomment to print all devices that were seen during a scan
 #define GAP_DBG_PRINTF(...) printf(__VA_ARGS__)
@@ -222,8 +244,24 @@ static void add_bt_scan_result(esp_bd_addr_t bda, esp_bt_cod_t *cod, esp_bt_uuid
 #if CONFIG_BT_BLE_ENABLED
 static void add_ble_scan_result(esp_bd_addr_t bda, esp_ble_addr_type_t addr_type, uint16_t appearance, uint8_t *name, uint8_t name_len, int rssi)
 {
-    if (find_scan_result(bda, ble_scan_results)) {
-        ESP_LOGW(TAG, "Result already exists!");
+    // Active scans can deliver the advertisement and scan response separately.
+    // Merge the later packet instead of discarding it as a duplicate.
+    esp_hid_scan_result_t *existing = find_scan_result(bda, ble_scan_results);
+    if (existing) {
+        existing->ble.addr_type = addr_type;
+        if (appearance) {
+            existing->ble.appearance = appearance;
+            existing->usage = esp_hid_usage_from_appearance(appearance);
+        }
+        if (rssi) existing->rssi = rssi;
+        if (existing->name == NULL && name && name_len) {
+            char *name_s = (char *)malloc(name_len + 1);
+            if (name_s) {
+                memcpy(name_s, name, name_len);
+                name_s[name_len] = 0;
+                existing->name = name_s;
+            }
+        }
         return;
     }
     esp_hid_scan_result_t *r = (esp_hid_scan_result_t *)malloc(sizeof(esp_hid_scan_result_t));
@@ -405,6 +443,7 @@ static void handle_ble_device_result(struct ble_scan_result_evt_param *scan_rst)
 {
 
     uint16_t uuid = 0;
+    bool hid_service = false;
     uint16_t appearance = 0;
     char name[64] = {0};
 
@@ -413,8 +452,33 @@ static void handle_ble_device_result(struct ble_scan_result_evt_param *scan_rst)
                                                scan_rst->adv_data_len + scan_rst->scan_rsp_len,
                                                ESP_BLE_AD_TYPE_16SRV_CMPL,
                                                &uuid_len);
-    if (uuid_d != NULL && uuid_len) {
-        uuid = uuid_d[0] + (uuid_d[1] << 8);
+    // HID may be advertised as an incomplete 16-bit UUID list (AD type 0x02),
+    // especially while an Xbox controller is in pairing mode. Accept both.
+    if (uuid_d == NULL) {
+        uuid_d = esp_ble_resolve_adv_data_by_type(scan_rst->ble_adv,
+                                               scan_rst->adv_data_len + scan_rst->scan_rsp_len,
+                                               ESP_BLE_AD_TYPE_16SRV_PART,
+                                               &uuid_len);
+    }
+    if (uuid_d != NULL && uuid_len >= 2) {
+        for (uint8_t i = 0; i + 1 < uuid_len; i += 2) {
+            uint16_t u = uuid_d[i] | ((uint16_t)uuid_d[i + 1] << 8);
+            if (!uuid) uuid = u;
+            if (u == ESP_GATT_UUID_HID_SVC) hid_service = true;
+        }
+    }
+    // Some controllers advertise HID in an incomplete UUID list. Check the
+    // incomplete-16-bit UUID AD type as well.
+    if (!hid_service) {
+        uuid_d = esp_ble_resolve_adv_data_by_type(scan_rst->ble_adv,
+                    scan_rst->adv_data_len + scan_rst->scan_rsp_len,
+                    ESP_BLE_AD_TYPE_16SRV_PART, &uuid_len);
+        if (uuid_d != NULL) {
+            for (uint8_t i = 0; i + 1 < uuid_len; i += 2) {
+                uint16_t u = uuid_d[i] | ((uint16_t)uuid_d[i + 1] << 8);
+                if (u == ESP_GATT_UUID_HID_SVC) { hid_service = true; break; }
+            }
+        }
     }
 
     uint8_t appearance_len = 0;
@@ -454,8 +518,14 @@ static void handle_ble_device_result(struct ble_scan_result_evt_param *scan_rst)
     }
     GAP_DBG_PRINTF("\n");
 
-    if (uuid == ESP_GATT_UUID_HID_SVC) {
-        add_ble_scan_result(scan_rst->bda, scan_rst->ble_addr_type, appearance, adv_name, adv_name_len, scan_rst->rssi);
+    // Preserve the Xbox pairing-mode fallback already used by this Talon build:
+    // some Xbox advertisements expose appearance/name but no UUID.
+    bool xbox_controller = (appearance == 0x03c4) ||
+                           (adv_name_len == strlen("Xbox Wireless Controller") &&
+                            memcmp(name, "Xbox Wireless Controller", strlen("Xbox Wireless Controller")) == 0);
+    if (hid_service || uuid == ESP_GATT_UUID_HID_SVC || xbox_controller) {
+        add_ble_scan_result(scan_rst->bda, scan_rst->ble_addr_type, appearance,
+                            adv_name, adv_name_len, scan_rst->rssi);
     }
 }
 #endif /* CONFIG_BT_BLE_ENABLED */
@@ -660,6 +730,14 @@ static esp_err_t init_ble_gap(void)
 {
     esp_err_t ret;
 
+    // esp_hidh supplies the HID GATTC handler, but the application must also
+    // register that callback with Bluedroid. Without it the HID layer can end
+    // up calling esp_ble_gattc_* with client_if 0, producing
+    // "unknown client_if: 0" and no OPEN/NOTIFY events.
+    if ((ret = esp_ble_gattc_register_callback(talon_gattc_callback)) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ble_gattc_register_callback failed: %d", ret);
+        return ret;
+    }
     if ((ret = esp_ble_gap_register_callback(ble_gap_event_handler)) != ESP_OK) {
         ESP_LOGE(TAG, "esp_ble_gap_register_callback failed: %d", ret);
         return ret;

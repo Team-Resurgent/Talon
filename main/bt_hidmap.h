@@ -33,6 +33,31 @@ typedef struct {
     bool        has_report_id;
 } hid_layout_t;
 
+enum {
+    S_DIGITAL,
+    S_A,
+    S_B,
+    S_X,
+    S_Y,
+    S_BLACK,
+    S_WHITE,
+    S_LT,
+    S_RT,
+    S_LX,
+    S_LY,
+    S_RX,
+    S_RY
+};
+
+#define D_UP    0x01
+#define D_DOWN  0x02
+#define D_LEFT  0x04
+#define D_RIGHT 0x08
+#define D_START 0x10
+#define D_BACK  0x20
+#define D_LS    0x40
+#define D_RS    0x80
+
 // Parse a raw HID report descriptor into a field table. Returns false if the
 // descriptor is malformed or holds no usable gamepad fields.
 bool hid_parse_descriptor(const uint8_t *desc, size_t len, hid_layout_t *out);
@@ -42,6 +67,12 @@ bool hid_parse_descriptor(const uint8_t *desc, size_t len, hid_layout_t *out);
 // matches are applied; returns true if anything was mapped.
 bool hid_report_to_state(const hid_layout_t *l, uint8_t report_id,
                          const uint8_t *data, size_t len, int state[13]);
+
+// Reset persistent report state/calibration when a new controller/report map is opened.
+void hid_mapping_reset(void);
+void hid_get_state(int state[13]);
+// Emit the parsed HID field layout to the ESP log for controller diagnosis.
+void hid_log_layout(const hid_layout_t *l);
 
 #ifdef __cplusplus
 }

@@ -23,7 +23,7 @@ bool bt_host_connect(const char *addr_str);
 // Disconnect and forget the bonded controller.
 void bt_host_forget(void);
 
-// Status JSON fragment (no braces): connected, addr, name, reports, last raw.
+// Status JSON fragment (no braces): connection/bond diagnostics, address/name, reports, raw report, trigger telemetry.
 void bt_host_status_json(char *out, size_t cap);
 
 // Disable the BT controller/stack. Called before an OTA flash write: BT

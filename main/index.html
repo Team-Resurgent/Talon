@@ -33,7 +33,11 @@
   .face button, .bw button { border-radius:50%; font-size:17px; color:#0d100d; border:none; }
   .face .bA { background:var(--a); } .face .bB { background:var(--b); }
   .face .bX { background:var(--x); } .face .bY { background:var(--y); }
-  .face button:active, .bw button:active { filter:brightness(1.6); }
+  .face button:active, .bw button:active,
+  .face button.on, .bw button.on {
+    filter:brightness(1.9) saturate(1.25) !important;
+    box-shadow:0 0 0 3px var(--hot), 0 0 18px var(--hot);
+  }
   /* black/white cluster between the d-pad and the face diamond */
   .bw { display:flex; flex-direction:column; gap:10px; justify-content:center; }
   .bw button { width:46px; height:46px; }
@@ -92,7 +96,7 @@
     </div>
     <div class="pad face">
       <i class="blank"></i><button class="bY" data-b="y">Y</button><i class="blank"></i>
-      <button class="bB" data-b="b">B</button><i class="blank"></i><button class="bX" data-b="x">X</button>
+      <button class="bX" data-b="x">X</button><i class="blank"></i><button class="bB" data-b="b">B</button>
       <i class="blank"></i><button class="bA" data-b="a">A</button><i class="blank"></i>
     </div>
   </div>
@@ -278,7 +282,45 @@ async function btScan() {
       d.style.cssText = 'display:flex;justify-content:space-between;width:100%;margin-top:6px';
       d.innerHTML = `<span>${n.gamepad ? '🎮 ' : ''}${n.name || n.addr}</span>` +
                     `<span style="color:var(--dim);font-size:12px">${n.rssi} dBm</span>`;
-      d.onclick = () => fetch('/api/bt/connect?addr=' + encodeURIComponent(n.addr));
+      d.onclick = async () => {
+        d.disabled = true;
+        const oldHtml = d.innerHTML;
+        d.innerHTML = `<span>🔄 CONNECTING…</span><span style="color:var(--dim);font-size:12px">${n.rssi} dBm</span>`;
+        try {
+          const r = await fetch('/api/bt/connect?addr=' + encodeURIComponent(n.addr));
+          const j = await r.json();
+          if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+          // The HTTP request only starts the BLE connection. Wait for the
+          // backend's real connection state instead of leaving this button
+          // stuck on "waiting…" forever.
+          d.innerHTML = `<span>🔄 CONNECTING… ${n.name || n.addr}</span><span style="color:var(--dim);font-size:12px">waiting for BLE</span>`;
+
+          let connected = false;
+          for (let i = 0; i < 20; i++) {       // up to ~10 seconds
+            await new Promise(resolve => setTimeout(resolve, 500));
+            try {
+              const sr = await fetch('/api/status', { cache: 'no-store' });
+              const st = await sr.json();
+              if (st.bt_connected) {
+                connected = true;
+                d.innerHTML = `<span>✅ CONNECTED — ${st.bt_name || n.name || n.addr}</span>` +
+                              `<span style="color:var(--dim);font-size:12px">${st.bt_reports || 0} reports</span>`;
+                break;
+              }
+            } catch (ignore) {}
+          }
+
+          if (!connected) {
+            d.disabled = false;
+            d.innerHTML = `<span>⚠️ CONNECT REQUESTED — still connecting</span>` +
+                          `<span style="color:var(--dim);font-size:12px">${n.rssi} dBm</span>`;
+          }
+        } catch (e) {
+          d.disabled = false;
+          d.innerHTML = oldHtml;
+          alert('BLE connect failed: ' + e.message);
+        }
+      };
       box.appendChild(d);
     });
     if (!list.length) box.textContent = 'No BLE controllers found. Put the pad in pairing mode and rescan.';
@@ -287,13 +329,73 @@ async function btScan() {
 }
 async function btForget() { await fetch('/api/bt/forget'); btnetsEl().innerHTML = ''; }
 
-// status poll
-setInterval(async () => {
+// ---- Live BLE controller display -----------------------------------------
+// /api/status already contains the decoded BLE controller state. Keep the
+// web page in sync with it so a refresh immediately reflects held buttons,
+// triggers and sticks instead of only showing the connection status.
+const dpadBits = { up: 1, down: 2, left: 4, right: 8 };
+const digitalBits = { start: 16, back: 32, ls: 64, rs: 128 };
+
+function setButton(name, on) {
+  const el = document.querySelector(`button[data-b="${name}"]`);
+  if (el) el.classList.toggle('on', !!on);
+}
+
+function updateControllerUI(s) {
+  // Keep browser Gamepad input from overwriting the ESP32's BLE state.
+  bleControllerActive = !!s.bt_connected;
+
+  setButton('a', s.a); setButton('b', s.b);
+  setButton('x', s.x); setButton('y', s.y);
+  setButton('lb', s.lb); setButton('rb', s.rb);
+  setButton('back', s.back); setButton('start', s.start);
+  setButton('ls', s.ls); setButton('rs', s.rs);
+  setButton('up', s.up); setButton('down', s.down);
+  setButton('left', s.left); setButton('right', s.right);
+  setButton('black', s.rb); setButton('white', s.lb);
+
+  const lt = document.getElementById('lt');
+  const rt = document.getElementById('rt');
+  if (lt && document.activeElement !== lt) lt.value = Number(s.lt) || 0;
+  if (rt && document.activeElement !== rt) rt.value = Number(s.rt) || 0;
+
+  const sticks = [
+    ['.stick[data-x="lx"]', s.lx, s.ly],
+    ['.stick[data-x="rx"]', s.rx, s.ry]
+  ];
+  for (const [sel, xv, yv] of sticks) {
+    const el = document.querySelector(sel);
+    const knob = el && el.querySelector('.knob');
+    if (!knob) continue;
+    const x = Math.max(-1, Math.min(1, (Number(xv) || 0) / 32767));
+    const y = Math.max(-1, Math.min(1, (Number(yv) || 0) / 32767));
+    knob.style.left = `${48 + x * 48}px`;
+    knob.style.top  = `${48 - y * 48}px`;
+  }
+
+  const gp = document.getElementById('gpstatus');
+  if (gp) {
+    if (s.bt_connected) {
+      gp.textContent = `BLE: ${s.bt_name || s.bt_addr || 'controller'} · live`;
+    } else {
+      gp.textContent = 'BLE controller not connected';
+    }
+  }
+}
+
+let statusPollBusy = false;
+async function pollStatus() {
+  if (statusPollBusy) return;
+  statusPollBusy = true;
   try {
-    const s = await (await fetch('/api/status')).json();
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const s = await r.json();
+
     document.getElementById('status').textContent =
       `${s.mounted ? 'CONNECTED to Xbox' : 'not enumerated'} · rssi ${s.rssi} dBm · ` +
       `reports ${s.in_ok}` + (s.rumble_l || s.rumble_r ? ` · rumble ${s.rumble_l}/${s.rumble_r}` : '');
+
     const bt = document.getElementById('btstate');
     if (bt) {
       if (s.bt_connected)
@@ -302,10 +404,19 @@ setInterval(async () => {
       else if (s.bt_bonded) bt.textContent = `bonded to ${s.bt_addr} — reconnecting…`;
       else bt.textContent = 'no controller paired';
     }
+
+    updateControllerUI(s);
   } catch (e) {
     document.getElementById('status').textContent = 'unreachable';
+  } finally {
+    statusPollBusy = false;
   }
-}, 2000);
+}
+
+// Fast enough to make button presses visibly live, while also acting as the
+// web heartbeat used by USB ownership. cache:'no-store' prevents stale JSON.
+pollStatus();
+setInterval(pollStatus, 100);
 </script>
 </body>
 </html>

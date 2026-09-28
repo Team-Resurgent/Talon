@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "tusb.h"
 #include "talon.h"
+#include "usb_owner.h"
 #include "talon_igr.h"
 #include "wifi_net.h"
 #include "bt_host.h"
@@ -85,10 +86,39 @@ static void url_decode(char *s) {
 }
 
 // Pull ?key= out of the query string; returns false if absent.
+// Some ESP-IDF/httpd configurations can return an empty query string from
+// httpd_req_get_url_query_str(), so fall back to parsing req->uri directly.
 static bool qs_value(httpd_req_t *req, const char *key, char *out, size_t outlen) {
-    char qs[256];
-    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) != ESP_OK) return false;
-    return httpd_query_key_value(qs, key, out, outlen) == ESP_OK;
+    if (!req || !key || !out || outlen == 0) return false;
+
+    // Parse req->uri first.  This preserves percent-encoded values exactly as
+    // received; httpd_req_get_url_query_str() may partially decode malformed or
+    // percent-encoded values on some ESP-IDF/httpd versions.  Callers that need
+    // decoding (such as Bluetooth addresses) call url_decode() explicitly.
+
+    // Direct parser: req->uri contains the original path + query.
+    // Parse key/value pairs without modifying req->uri.
+    const char *q = strchr(req->uri, '?');
+    if (!q) return false;
+    q++;
+
+    const size_t keylen = strlen(key);
+    while (*q) {
+        const char *eq = strchr(q, '=');
+        if (!eq) break;
+        const char *amp = strchr(eq + 1, '&');
+        size_t klen = (size_t)(eq - q);
+        if (klen == keylen && strncmp(q, key, keylen) == 0) {
+            size_t vlen = amp ? (size_t)(amp - (eq + 1)) : strlen(eq + 1);
+            if (vlen >= outlen) vlen = outlen - 1;
+            memcpy(out, eq + 1, vlen);
+            out[vlen] = '\0';
+            return true;
+        }
+        if (!amp) break;
+        q = amp + 1;
+    }
+    return false;
 }
 
 static esp_err_t api_ok(httpd_req_t *req) {
@@ -206,9 +236,10 @@ static esp_err_t bt_scan_get(httpd_req_t *req) {
 }
 
 static esp_err_t bt_connect_get(httpd_req_t *req) {
-    char addr[24];
+    char addr[40];
     if (!qs_value(req, "addr", addr, sizeof(addr))) return api_bad(req, "missing addr");
     url_decode(addr);
+    ESP_LOGI(TAG, "BLE connect request addr='%s' uri='%s'", addr, req->uri);
     if (!bt_host_connect(addr)) return api_bad(req, "bad addr");
     return api_ok(req);
 }
@@ -219,6 +250,9 @@ static esp_err_t bt_forget_get(httpd_req_t *req) {
 }
 
 static esp_err_t status_get(httpd_req_t *req) {
+    // /api/status is the browser heartbeat. A recent request keeps Talon USB
+    // attached even when no BLE controller is connected.
+    usb_owner_web_activity();
     char ip[16] = "";
     int rssi = 0;
     wifi_net_up(ip, &rssi);
@@ -229,9 +263,9 @@ static esp_err_t status_get(httpd_req_t *req) {
 
     static const char *mode_names[] = { "sta", "setup", "wps" };
     static const char *wps_names[]  = { "idle", "connecting", "connected", "failed" };
-    char btbuf[220];
+    char btbuf[1024];
     bt_host_status_json(btbuf, sizeof(btbuf));
-    char body[768];
+    char body[1536];
     snprintf(body, sizeof(body),
         "{\"mounted\":%d,\"ip\":\"%s\",\"rssi\":%d,"
         "\"mode\":\"%s\",\"ssid\":\"%s\",\"hostname\":\"" TALON_HOSTNAME "\","
@@ -239,15 +273,20 @@ static esp_err_t status_get(httpd_req_t *req) {
         "\"in_ok\":%lu,\"in_err\":%lu,\"rumble_pkts\":%lu,"
         "\"open\":%lu,\"reset\":%lu,\"ctrl_xid\":%lu,"
         "\"rumble_l\":%u,\"rumble_r\":%u,"
-        "\"digital\":%u,\"free_heap\":%u,%s}",
-        tud_mounted() ? 1 : 0, ip, rssi,
+        "\"digital\":%u,\"free_heap\":%u,"
+        "\"usb_active\":%d,\"usb_ble\":%d,\"usb_web\":%d,%s}",
+        usb_owner_mounted() ? 1 : 0, ip, rssi,
         mode_names[wifi_net_mode()], wifi_net_ssid(),
         wps_names[wifi_net_wps_state()], wifi_net_wps_remaining(),
         (unsigned long)g_xid_in_ok, (unsigned long)g_xid_in_err,
         (unsigned long)g_xid_out_pkts,
         (unsigned long)g_xid_open, (unsigned long)g_xid_reset,
         (unsigned long)g_xid_ctrl_xid,
-        rl, rr, rep[2], (unsigned)esp_get_free_heap_size(), btbuf);
+        rl, rr, rep[2], (unsigned)esp_get_free_heap_size(),
+        usb_owner_active() ? 1 : 0,
+        usb_owner_ble_active() ? 1 : 0,
+        usb_owner_web_active() ? 1 : 0,
+        btbuf);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }

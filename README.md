@@ -1,5 +1,22 @@
 <h1 align="center">Talon</h1>
 
+This is a fix of Team-Resurgents Talon.
+I'm not sure if I can submit anything on the main repo so I made a small fork but all credit goes to EqUiNoX
+What changed ?
+First of all Talon is now pairing with a BLE controller (big success)
+Secondly I swapped X-B buttons in the webapp to be similar to an Xbox controller
+Also got the webapp to shown the keys pressed on the controller (not very usefull but it's there if someone need to test their controller)
+Then added a 3 minutes delay to pair a device. If nothing if interacting with Talon it will send the ESP32 to sleep 
+
+STEALTH MODE
+It is now stealth on USB if nothing is paired. 
+This is for people who want to have Talon "inside" the XBOX (there is just enough space behind port3-4 for an ESP32S3 to fit between the case and the shielding) 
+and soldering GPIo19 to D- and GPIo20 to D+ on the controller motherboard (obviously 5V and GND need to be soldered too)
+So now We can hook a real controller in port 1 and play wired or unplug it and use a wireless BLE controller with nothing hanging out of the XBOX.
+
+I'm not a coder. I did some tinkering going back and forth during a whole day with ChatGPT. 
+As far as I tested it's working fine and keeps the connection alive which isn't the case of OGXmini on a picoW.
+
 <p align="center"><b>A WiFi &amp; Bluetooth-enabled original Xbox controller, emulated on an ESP32-S3</b></p>
 
 <p align="center">
